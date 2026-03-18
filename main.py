@@ -1,133 +1,132 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 import uvicorn
 import logging
 from datetime import datetime
+from database import SessionLocal, engine
+import models
 
-# Konfigurasi logging
+# Create tables
+models.Base.metadata.create_all(bind=engine)
+
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Enhanced Task API")
 
-# Tambahkan CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Model untuk Task dengan validasi
+# DB Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Pydantic Model
 class Task(BaseModel):
-    id: Optional[int] = Field(None, gt=0, description="Unique task ID")
-    title: str = Field(..., min_length=1, max_length=100, description="Task title")
-    description: Optional[str] = Field(None, max_length=500, description="Task description")
-    completed: bool = Field(False, description="Task completion status")
+    id: Optional[int] = Field(None, gt=0)
+    title: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    completed: bool = False
     created_at: datetime = Field(default_factory=datetime.now)
+
+    class Config:
+        from_attributes = True  # important for SQLAlchemy
 
     @field_validator("title")
     @classmethod
     def title_must_not_be_empty(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("Title cannot be empty or only whitespace")
+            raise ValueError("Title cannot be empty")
         return v.strip()
 
-    @field_validator("description")
-    @classmethod
-    def description_must_not_be_empty(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            raise ValueError("Description cannot be empty or only whitespace")
-        return v.strip() if v else None
-
-# Simulasi database sederhana
-tasks_db: List[Task] = []
-current_id = 1
-
-def get_next_id() -> int:
-    global current_id
-    id = current_id
-    current_id += 1
-    return id
+# ------------------- API -------------------
 
 @app.get("/tasks", response_model=List[Task])
-async def get_tasks(
-    completed: Optional[bool] = Query(None, description="Filter by completion status"),
-    search: Optional[str] = Query(None, description="Search tasks by title or description")
+def get_tasks(
+    completed: Optional[bool] = Query(None),
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
 ):
-    """Mengembalikan daftar tugas dengan opsi filter dan pencarian."""
-    try:
-        filtered_tasks = tasks_db
-        if completed is not None:
-            filtered_tasks = [task for task in filtered_tasks if task.completed == completed]
-        if search:
-            search = search.lower()
-            filtered_tasks = [
-                task for task in filtered_tasks
-                if search in task.title.lower() or (task.description and search in task.description.lower())
-            ]
-        logger.info(f"Retrieved {len(filtered_tasks)} tasks")
-        return filtered_tasks
-    except Exception as e:
-        logger.error(f"Error retrieving tasks: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    query = db.query(models.Task)
+
+    if completed is not None:
+        query = query.filter(models.Task.completed == completed)
+
+    if search:
+        query = query.filter(models.Task.title.contains(search))
+
+    tasks = query.all()
+    return tasks
+
 
 @app.get("/tasks/{task_id}", response_model=Task)
-async def get_task(task_id: int):
-    """Mengembalikan tugas berdasarkan ID."""
-    try:
-        for task in tasks_db:
-            if task.id == task_id:
-                logger.info(f"Retrieved task with ID {task_id}")
-                return task
+def get_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    except Exception as e:
-        logger.error(f"Error retrieving task {task_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+
+    return task
+
 
 @app.post("/tasks", response_model=Task)
-async def create_task(task: Task):
-    """Membuat tugas baru."""
-    try:
-        task.id = get_next_id()
-        tasks_db.append(task)
-        logger.info(f"Created task with ID {task.id}")
-        return task
-    except Exception as e:
-        logger.error(f"Error creating task: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+def create_task(task: Task, db: Session = Depends(get_db)):
+    db_task = models.Task(
+        title=task.title,
+        description=task.description,
+        completed=task.completed
+    )
+
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+
+    return db_task
+
 
 @app.put("/tasks/{task_id}", response_model=Task)
-async def update_task(task_id: int, updated_task: Task):
-    """Memperbarui tugas berdasarkan ID."""
-    try:
-        for index, task in enumerate(tasks_db):
-            if task.id == task_id:
-                updated_task.id = task_id  # Ensure ID remains the same
-                tasks_db[index] = updated_task
-                logger.info(f"Updated task with ID {task_id}")
-                return updated_task
+def update_task(task_id: int, updated_task: Task, db: Session = Depends(get_db)):
+    db_task = db.query(models.Task).filter(models.Task.id == task_id).first()
+
+    if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    except Exception as e:
-        logger.error(f"Error updating task {task_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+
+    db_task.title = updated_task.title
+    db_task.description = updated_task.description
+    db_task.completed = updated_task.completed
+
+    db.commit()
+    db.refresh(db_task)
+
+    return db_task
+
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int):
-    """Menghapus tugas berdasarkan ID."""
-    try:
-        for index, task in enumerate(tasks_db):
-            if task.id == task_id:
-                tasks_db.pop(index)
-                logger.info(f"Deleted task with ID {task_id}")
-                return {"message": "Task deleted successfully"}
+def delete_task(task_id: int, db: Session = Depends(get_db)):
+    db_task = db.query(models.Task).filter(models.Task.id == task_id).first()
+
+    if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    except Exception as e:
-        logger.error(f"Error deleting task {task_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+
+    db.delete(db_task)
+    db.commit()
+
+    return {"message": "Task deleted successfully"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
