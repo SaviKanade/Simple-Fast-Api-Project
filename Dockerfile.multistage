@@ -1,0 +1,12 @@
+FROM python:3.14-slim as builder
+WORKDIR /app
+COPY requirements.txt .
+COPY . /app
+RUN pip install -r requirements.txt --target /app/libraries
+FROM python:3.14-slim as deployer
+WORKDIR /app
+COPY --from=builder /app/libraries .
+COPY --from=builder /app .
+ENV PYTHONPATH='/app/libraries'
+EXPOSE 8000
+CMD ["python", "main.py"]
